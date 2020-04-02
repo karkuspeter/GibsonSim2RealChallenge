@@ -1,18 +1,13 @@
 import argparse
 
-from simple_agent import RandomAgent, ForwardOnlyAgent
-from rl_agent import SACAgent
+import matplotlib
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+plt.ion()
+
+from agents.myagents import MyAgent, get_agent
 
 from gibson2.envs.challenge import Challenge
-
-
-def get_agent(agent_class, ckpt_path=""):
-    if agent_class == "Random":
-        return RandomAgent()
-    elif agent_class == "ForwardOnly":
-        return ForwardOnlyAgent()
-    elif agent_class == "SAC":
-        return SACAgent(root_dir=ckpt_path)
 
 
 def main():

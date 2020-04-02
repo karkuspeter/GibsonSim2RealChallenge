@@ -21,7 +21,10 @@ done
 
 
 docker run -v $(pwd)/gibson-challenge-data:/gibson-challenge-data \
+    -v $(pwd)/../GibsonEnvV2:/opt/GibsonEnvV2 \
+    -v $(pwd)/agents:/agents \
     --runtime=nvidia \
     ${DOCKER_NAME} \
     /bin/bash -c \
     "export CONFIG_FILE=/gibson-challenge-data/locobot_p2p_nav_house.yaml; export SIM2REAL_TRACK=static; cp /gibson-challenge-data/global_config.yaml /opt/GibsonEnvV2/gibson2/global_config.yaml; bash submission.sh"
+
