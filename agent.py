@@ -21,7 +21,8 @@ def main():
         ckpt_path=args.ckpt_path
     )
     challenge = Challenge()
-    challenge.submit(agent)
+    # challenge.submit(agent)
+    challenge.save_episodes(agent)
 
 
 if __name__ == "__main__":
