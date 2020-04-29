@@ -1,0 +1,13 @@
+data/
+temp_images/
+figs/
+videos/
+figs*/
+*global_config.yaml
+.git/
+.idea/
+*.pyc
+dataflow-pipe*
+.DS_Store
+.gitignore
+.gitmodules
