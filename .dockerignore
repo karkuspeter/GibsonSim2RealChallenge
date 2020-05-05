@@ -1,0 +1,11 @@
+gibson-challenge-data
+*.pyc
+.gitignore
+.git
+data/*tfrecords*
+data/eval*
+data/scen*
+GibsonEnvV2
+results
+submission
+x11docker

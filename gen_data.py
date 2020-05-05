@@ -16,13 +16,16 @@ import gibson2
 
 from multiprocessing import Process, Pool, Lock
 
+SINGLE_CORE = False
+
 
 def save_episodes_helper(model_name, output_filename, write_lock=None):
     from gibson2.envs.challenge import Challenge
 
     agent = ExpertAgent()
     challenge = Challenge()
-    challenge.save_episodes(agent, output_filename=output_filename, models=[model_name], write_lock=write_lock)
+    challenge.save_episodes(agent, output_filename=output_filename, models=[model_name], write_lock=write_lock,
+                            num_episodes_per_floor=20)
 
 
 def main():
@@ -39,7 +42,7 @@ def main():
         models = models[67:-10] + models[:66]
     else:
         models = models[-10:]
-    models = models * 5
+    models = models * 2
     print (models)
     assert len(models) < 1000
 
@@ -55,11 +58,14 @@ def main():
     # pool.join()
 
     for i, model_name in enumerate(models):
-        # This is to limit memory leak
-        p = Process(target=save_episodes_helper, args=(model_name, output_filename + '.{:03d}'.format(i)))
-        p.start()
-        p.join()
-        p.terminate()
+        if SINGLE_CORE:
+            save_episodes_helper(model_name, output_filename + '.{:03d}'.format(i))
+        else:
+            # This is to limit memory leak
+            p = Process(target=save_episodes_helper, args=(model_name, output_filename + '.{:03d}'.format(i)))
+            p.start()
+            p.join()
+            p.terminate()
 
 
 if __name__ == "__main__":

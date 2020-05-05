@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-DOCKER_NAME="my_submission"
+DOCKER_NAME="my_submission_clean2"
 
 while [[ $# -gt 0 ]]
 do
@@ -19,10 +19,11 @@ case $key in
 esac
 done
 
+    # -v $(pwd)/../GibsonEnvV2:/opt/GibsonEnvV2 \
+    # -v $(pwd)/agents:/agents \
 
-docker run -v $(pwd)/gibson-challenge-data:/gibson-challenge-data \
-    -v $(pwd)/../GibsonEnvV2:/opt/GibsonEnvV2 \
-    -v $(pwd)/agents:/agents \
+docker run -ti -v $(pwd)/../GibsonSim2RealChallengeClean/gibson-challenge-data:/gibson-challenge-data \
+    -v $(pwd)/temp:/temp \
     --runtime=nvidia \
     ${DOCKER_NAME} \
     /bin/bash -c \
