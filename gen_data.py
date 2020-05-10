@@ -19,15 +19,6 @@ from multiprocessing import Process, Pool, Lock
 SINGLE_CORE = False
 
 
-def save_episodes_helper(model_name, output_filename, write_lock=None):
-    from gibson2.envs.challenge import Challenge
-
-    agent = ExpertAgent()
-    challenge = Challenge()
-    challenge.save_episodes(agent, output_filename=output_filename, models=[model_name], write_lock=write_lock,
-                            num_episodes_per_floor=20)
-
-
 def main():
     parser = argparse.ArgumentParser()
     # parser.add_argument("--agent-class", type=str, default="Random", choices=["Random", "ForwardOnly", "SAC"])

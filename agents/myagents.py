@@ -11,13 +11,14 @@ import time
 
 from train import get_brain
 from common_net import load_from_file, count_number_trainable_params
-from preprocess import sim2mapping, mapping2sim
+from preprocess import sim2mapping, mapping2sim, object_map_from_states
 from visualize_mapping import plot_viewpoints, plot_target_and_path, mapping_visualizer
 
 import numpy as np
 import tensorflow as tf
 
 from gibsonagents.expert import Expert
+from gibsonagents.classic_mapping import ClassicMapping
 
 # from gibson2.core.physics.scene import BuildingScene
 from gibson2.envs.locomotor_env import NavigateEnv
@@ -30,8 +31,12 @@ except Exception:
     import pdb
 
 
-POSE_ESTIMATION_SOURCE = 'velocity'
-PLOT_EVERY_N_STEP = 10
+POSE_ESTIMATION_SOURCE = 'velocity'  #''true' # 'velocity'
+MAP_SOURCE = 'pred'   # 'label'  # 'pred'
+USE_OBJECT_MAP_FOR_TRACK = [False, True, False]
+IGNORE_OBJECT_MAP = True
+PLOT_EVERY_N_STEP = -1  # 10
+START_WITH_SPIN = True
 
 
 
@@ -55,11 +60,42 @@ class MappingAgent(RandomAgent):
         super(MappingAgent, self).__init__()
 
         self.sim2real_track = str(os.environ["SIM2REAL_TRACK"])
+        print (" ******* \n \n \n *******")
         print ("Initializing agent. %s track."%self.sim2real_track)
+        try:
+            config_file = os.environ['CONFIG_FILE']
+            print (config_file)
+            from gibson2.utils.utils import parse_config
+            config = parse_config(config_file)
+            print (config)
+
+        except:
+            print ("Cannot print config.")
+        print(" ******* \n \n \n *******")
+
+        # Replace load
+        track_i = (0 if self.sim2real_track == 'static' else (1 if self.sim2real_track == 'interactive' else 2))
+        load_for_track = params.gibson_load_for_tracks[track_i]
+        if load_for_track != '':
+            params.load = [load_for_track, ]
+
+        params.object_map = (1 if USE_OBJECT_MAP_FOR_TRACK[track_i] else 0)
+
+        print (params)
 
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
         self.params = params
         self.pose_estimation_source = POSE_ESTIMATION_SOURCE
+        self.map_source = MAP_SOURCE
+        self.start_with_spin = START_WITH_SPIN
+        self.max_confidence = 0.96   # 0.98
+        self.confidence_threshold = None  # (0.2, 0.01)  # (0.35, 0.05)
+        self.use_custom_visibility = (self.params.visibility_mask == 2)
+        self.use_object_map = (self.params.object_map > 0)  # if want to change also need to overwrite params.object_map
+
+        self.map_ch = (3 if self.use_object_map else 2)
+        self.accumulated_spin = 0.
+        self.spin_direction = None
 
         params.batchdata = 1
         params.trajlen = 1
@@ -72,6 +108,8 @@ class MappingAgent(RandomAgent):
                 # dataflow input
                 train_brain = get_brain(params.brain, params)
                 req = train_brain.requirements()
+                self.brain_requirements = req
+                self.local_map_shape = req.local_map_size
 
                 # global_map = tf.zeros((1, ) + self.global_map_size + (1, ), dtype=tf.float32)
                 self.true_map_input = tf.placeholder(shape=self.max_map_size + (1, ), dtype=tf.uint8)
@@ -80,16 +118,19 @@ class MappingAgent(RandomAgent):
                 self.yaw_input = tf.placeholder(shape=(1, ), dtype=tf.float32)
                 # self.action_input = tf.placeholder(shape=(2,), dtype=tf.float32)
                 actions = tf.zeros((1, 1, 2), dtype=tf.float32)
-                self.global_map_input = tf.placeholder(shape=self.max_map_size + (2, ), dtype=tf.float32)
+                self.global_map_input = tf.placeholder(shape=self.max_map_size + (self.map_ch, ), dtype=tf.float32)
+                self.visibility_input = tf.placeholder(shape=self.local_map_shape + (1, ), dtype=tf.uint8) if self.use_custom_visibility else None
+                local_obj_map_labels = tf.zeros((1, 1, ) + self.local_map_shape + (1, ), dtype=np.uint8)
 
                 self.inference_outputs = train_brain.sequential_inference(
                     self.true_map_input[None], self.images_input[None, None], self.xy_input[None, None], self.yaw_input[None, None],
                     actions, prev_global_map_logodds=self.global_map_input[None],
-                    confidence_threshold=(0.35, 0.05),
+                    local_obj_maps=local_obj_map_labels,
+                    confidence_threshold=self.confidence_threshold,
+                    max_confidence=self.max_confidence,
+                    max_obj_confidence=0.8,
+                    custom_visibility_maps=None if self.visibility_input is None else self.visibility_input[None, None],
                     is_training=True)
-                # global_map, images, xy, yaw, actions = train_data[:5]
-                # train_outputs = train_brain.sequential_inference(
-                #     global_map, images, xy, yaw, actions, is_training=True)
 
                 # Add the variable initializer Op.
                 init = tf.group(tf.global_variables_initializer(), tf.local_variables_initializer())
@@ -124,12 +165,14 @@ class MappingAgent(RandomAgent):
             pass
 
     def reset(self):
-        self.global_map_logodds = np.zeros((1, 1) + (2,), np.float32)
+        self.global_map_logodds = np.zeros((1, 1) + (self.map_ch, ), np.float32)
         # self.global_map_logodds = np.zeros(self.max_map_size + (2,), np.float32)
         self.step_i = 0
         self.xy = np.zeros((2,), np.float32)
         self.yaw = np.zeros((1,), np.float32)
         self.target_xy = np.zeros((2, ), np.float32)
+        self.accumulated_spin = 0.
+        self.spin_direction = None
 
         self.hist1 = np.zeros((0, 3))
         self.hist2 = np.zeros((0, 3))
@@ -140,13 +183,28 @@ class MappingAgent(RandomAgent):
     def inverse_logodds(x):
         return 1. - 1. / (1 + np.exp(x))
 
-    def plan_and_control(self, xy, yaw, global_map_pred, target_xy):
+    def plan_and_control(self, xy_mapping, yaw_mapping, lin_vel_sim, ang_vel_sim, target_r_sim, target_fi_sim, global_map_pred, target_xy):
 
         # Convert to sim representation for expert planning and control
-        xy = mapping2sim(xy=xy)
-        yaw = mapping2sim(yaw=yaw)
+        xy = mapping2sim(xy=xy_mapping)
+        yaw = mapping2sim(yaw=yaw_mapping)
         global_map_pred = mapping2sim(global_map_pred=global_map_pred)
         target_xy = mapping2sim(xy=target_xy)
+        lin_vel = sim2mapping(lin_vel=lin_vel_sim)
+        ang_vel = sim2mapping(ang_vel=ang_vel_sim)
+
+        if self.start_with_spin and np.abs(self.accumulated_spin) < np.deg2rad(360 - 70) and self.step_i < 40:
+            if self.spin_direction is None:
+                self.spin_direction = -np.sign(target_fi_sim)  # spin opposite direction to the goal
+            self.accumulated_spin += ang_vel
+            # spin
+
+            print ("%d: spin %f: %f"%(self.step_i, self.spin_direction, self.accumulated_spin))
+
+            action = np.array((0., self.spin_direction * 1.))
+            planned_path = np.zeros((0, 2))
+            return action, planned_path
+
 
         # TODO need to treat case where map needs to be extended !!!!!
         #  Move this logic to map update instead
@@ -161,14 +219,23 @@ class MappingAgent(RandomAgent):
         # #print (global_map_pred.shape)
         # # pdb.set_trace()
 
+        if self.use_object_map:
+            assert global_map_pred.shape[-1] == 2
+            if IGNORE_OBJECT_MAP:
+                global_map_pred = global_map_pred[..., :1]
+        else:
+            assert global_map_pred.shape[-1] == 1
+
         # Scan map and cost graph.
         scan_graph, scan_map, resized_scan_map, cost_map = Expert.get_graph_and_eroded_map(
-            raw_trav_map=global_map_pred,
-            trav_map_for_simulator=global_map_pred,
+            raw_trav_map=global_map_pred[..., :1],
+            trav_map_for_simulator=global_map_pred[..., :1],
             raw_scan_map=global_map_pred,
             rescale_scan_map=1.,
             erosion=self.scan_map_erosion,
-            build_graph=False)
+            build_graph=False,
+            interactive_channel=self.use_object_map and not IGNORE_OBJECT_MAP,
+        )
 
         # TODO split plan and control.
         #  Move it into third file, expert.py, as staticmethods and import that everywhere
@@ -195,9 +262,6 @@ class MappingAgent(RandomAgent):
         # plt.show()
         # plt.ginput(timeout=0.01)
 
-        assert self.params.mode == "both"
-
-
         if "trav_map" not in observations.keys():
             # No extra info
             observations["trav_map"] = np.zeros((10, 10, 2), np.uint8)
@@ -214,6 +278,8 @@ class MappingAgent(RandomAgent):
         # Target from extra state obs.
         self.update_pose_from_observation(observations)
         # Updates xy, yaw, target_xy all represented in mapping format  (transposed map used in neural net)
+
+        target_r, target_fi, lin_vel, ang_vel = observations['sensor']
 
         # Expand map and offset pose if needed, such that target and the surrounding of current pose are all in the map.
         map_shape = self.global_map_logodds.shape
@@ -242,7 +308,12 @@ class MappingAgent(RandomAgent):
 
         depth = observations["depth"]
         rgb = observations["rgb"]
-        images = np.concatenate([depth, rgb], axis=-1)  # these are 0..1  float format
+        if self.params.mode == 'both':
+            images = np.concatenate([depth, rgb], axis=-1)  # these are 0..1  float format
+        elif self.params.mode == 'depth':
+            images = depth
+        else:
+            images = rgb
         images = (images * 255).astype(np.uint8)
         images = np.array(images, np.float32)
         # images = images * 255  # to unit8 0..255 format
@@ -253,12 +324,20 @@ class MappingAgent(RandomAgent):
         global_map_label = observations["trav_map"]
         global_map_label = global_map_label[:, :, :1]  # input it as uint8
         assert global_map_label.dtype == np.uint8
+
+        # if 'object_states' in observations:
+        #     object_map_label = object_map_from_states(observations['object_states'], global_map_label.shape, combine_maps=True)
+        #     plt.figure()
+        #     plt.imshow(object_map_label[..., 0])
+        #     plt.show()
+        #     pdb.set_trace()
+
         global_map_label = sim2mapping(global_map=global_map_label)
         true_map_input = np.zeros(self.max_map_size + (1, ), np.uint8)
         global_map_label = global_map_label[:self.max_map_size[0], :self.max_map_size[1]]
         true_map_input[:global_map_label.shape[0], :global_map_label.shape[1]] = global_map_label
 
-        last_global_map_input = np.zeros(self.max_map_size + (2, ), np.float32)
+        last_global_map_input = np.zeros(self.max_map_size + (self.map_ch, ), np.float32)
         last_global_map_input[:map_shape[0], :map_shape[1]] = self.global_map_logodds
 
         feed_dict = {
@@ -266,100 +345,147 @@ class MappingAgent(RandomAgent):
             self.global_map_input: last_global_map_input,
             self.true_map_input: true_map_input,
         }
+        if self.visibility_input is not None:
+            visibility_map = ClassicMapping.is_visible_from_depth(depth, self.local_map_shape, zoom_factor=self.brain_requirements.transform_window_scaler)
+            feed_dict[self.visibility_input] = visibility_map[:, :, None].astype(np.uint8)
 
-        outputs = self.sess.run(self.inference_outputs, feed_dict=feed_dict)
+        outputs = self.run_inference(feed_dict)
 
-        global_map_logodds = np.array(outputs.global_map_logodds[0, -1])  # squeeze
+        global_map_logodds = np.array(outputs.global_map_logodds[0, -1])  # squeeze batch and traj
         global_map_logodds = global_map_logodds[:map_shape[0], :map_shape[1]]
         self.global_map_logodds = global_map_logodds
 
-        # global_map_true = self.inverse_logodds(self.global_map_logodds[:, :, 0])
-        global_map_pred = self.inverse_logodds(self.global_map_logodds[:, :, 1:2])
-        global_map_true_partial = self.inverse_logodds(self.global_map_logodds[:, :, 0:1])
         local_map_label = outputs.local_map_label[0, 0, :, :, 0]
-        local_map_pred = outputs.local_map_pred[0, 0, :, :, 0]
+        local_map_pred = outputs.combined_local_map_pred[0, 0, :, :, 0]
+
+        # global_map_true = self.inverse_logodds(self.global_map_logodds[:, :, 0])
+        global_map_true_partial = self.inverse_logodds(self.global_map_logodds[:, :, 0:1])
+        if self.use_object_map:
+            global_map_pred = self.inverse_logodds(self.global_map_logodds[:, :, 1:3])
+            local_obj_map_pred = outputs.combined_local_map_pred[0, 0, :, :, 1]
+        else:
+            global_map_pred = self.inverse_logodds(self.global_map_logodds[:, :, 1:2])
+            local_obj_map_pred = None
 
         # action = observations["expert_action"]
 
-        # global_map_for_planning = global_map_label.astype(np.float32) * (1./255.)  # Use full true map
+        if self.map_source == 'true':
+            assert global_map_label.ndim == 3
+            global_map_for_planning = global_map_label.astype(np.float32) * (1./255.)  # Use full true map
+            if self.use_object_map:
+                object_map_label = object_map_from_states(observations['object_states'], global_map_label.shape, combine_maps=True)
+                assert object_map_label.dtype == np.uint8
+                object_map_label = object_map_label.astype(np.float32) * (1./255.)
+                global_map_for_planning = np.concatenate((global_map_for_planning, object_map_label), axis=-1)
+
         # global_map_for_planning = global_map_true_partial
-        global_map_for_planning = global_map_pred
+        else:
+            global_map_for_planning = global_map_pred
 
         # threshold
         traversable_threshold = 0.499  # higher than this is traversable
-        global_map_for_planning = np.array(global_map_for_planning >= traversable_threshold, np.float32)
+        if IGNORE_OBJECT_MAP:
+            object_treshold = 0.  # treat everything as non-object
+        else:
+            object_treshold = 0.499  # treat as non-object by default
+        threshold_const = np.array((traversable_threshold, object_treshold))[None, None, :self.map_ch-1]
+        global_map_for_planning = np.array(global_map_for_planning >= threshold_const, np.float32)
 
         # plan
         action, planned_path = self.plan_and_control(
-            self.xy, self.yaw, global_map_pred=global_map_for_planning, target_xy=self.target_xy)
+            self.xy, self.yaw, lin_vel, ang_vel, target_r, target_fi, global_map_pred=global_map_for_planning,
+            target_xy=self.target_xy)
 
         # Visualize agent
         if self.step_i % PLOT_EVERY_N_STEP == 0 and PLOT_EVERY_N_STEP > 0:
-            xy, yaw = self.xy, self.yaw
-            status_msg = "step %d"%(self.step_i, )
-
-            # assert global_map_label.shape[-1] == 3
-            global_map_label = np.concatenate([global_map_label, np.zeros_like(global_map_label), np.zeros_like(global_map_label)], axis=-1)
-
-            plt.figure("Global map label")
-            plt.imshow(global_map_label)
-            plot_viewpoints(xy[0], xy[1], yaw)
-            plot_target_and_path(target_xy=self.target_xy, path=planned_path)
-            plt.title(status_msg)
-            plt.savefig('./temp/global-map-label.png')
-
-            plt.figure("Global map (%d)"%self.step_i)
-            map_to_plot = global_map_pred
-            map_to_plot = np.concatenate([map_to_plot, np.zeros_like(map_to_plot), np.zeros_like(map_to_plot)], axis=-1)
-            plt.imshow(map_to_plot)
-            plot_viewpoints(xy[0], xy[1], yaw)
-            #plot_target_and_path(target_xy=self.target_xy, path=planned_path)
-            plot_target_and_path(target_xy=self.target_xy_vel, path=np.array(self.hist2)[:, :2])
-
-            plt.title(status_msg)
-            plt.savefig('./temp/global-map-pred.png')
-
-            plt.figure("Global map true (%d)"%self.step_i)
-            map_to_plot = global_map_true_partial
-            map_to_plot = np.concatenate([map_to_plot, np.zeros_like(map_to_plot), np.zeros_like(map_to_plot)], axis=-1)
-            plt.imshow(map_to_plot)
-            plot_viewpoints(xy[0], xy[1], yaw)
-            # plot_target_and_path(target_xy=self.target_xy, path=planned_path)
-            plot_target_and_path(target_xy=self.target_xy, path=np.array(self.hist1)[:, :2])
-            plot_target_and_path(target_xy=self.target_xy_vel, path=np.array(self.hist2)[:, :2])
-            plt.title(status_msg)
-            plt.savefig('./temp/global-map-true.png')
-
-            plt.figure("Global map plan (%d)"%self.step_i)
-            map_to_plot = global_map_for_planning
-            map_to_plot = np.concatenate([map_to_plot, np.zeros_like(map_to_plot), np.zeros_like(map_to_plot)], axis=-1)
-            plt.imshow(map_to_plot)
-            plot_viewpoints(xy[0], xy[1], yaw)
-            plot_target_and_path(target_xy=self.target_xy, path=planned_path)
-            plt.title(status_msg)
-            plt.savefig('./temp/global-map-plan.png')
-
-            depth, rgb = mapping_visualizer.recover_depth_and_rgb(images)
-
-            images_fig, images_axarr = plt.subplots(2, 2, squeeze=True)
-            plt.title(status_msg)
-            plt.axes(images_axarr[0, 0])
-            plt.imshow(depth)
-            plt.axes(images_axarr[0, 1])
-            plt.imshow(rgb)
-            plt.axes(images_axarr[1, 0])
-            plt.imshow(local_map_pred)
-            plt.axes(images_axarr[1, 1])
-            plt.imshow(local_map_label)
-            plt.savefig('./temp/inputs.png')
-
-            # pdb.set_trace()
-
-            plt.close('all')
+            self.visualize_agent(outputs, images, global_map_pred, global_map_for_planning, global_map_label,
+                                 global_map_true_partial, local_map_pred, local_map_label, planned_path,
+                                 sim_rgb=observations['rgb'], local_obj_map_pred=local_obj_map_pred)
 
         self.step_i += 1
 
         return action
+
+    def visualize_agent(self, outputs, images, global_map_pred, global_map_for_planning, global_map_label,
+                        global_map_true_partial, local_map_pred, local_map_label, planned_path, sim_rgb=None, local_obj_map_pred=None):
+        xy, yaw = self.xy, self.yaw
+        status_msg = "step %d" % (self.step_i,)
+        visibility_mask = outputs.tiled_visibility_mask[0, 0, :, :, 0]
+        # assert global_map_label.shape[-1] == 3
+        global_map_label = np.concatenate(
+            [global_map_label, np.zeros_like(global_map_label), np.zeros_like(global_map_label)], axis=-1)
+        plt.figure("Global map label")
+        plt.imshow(global_map_label)
+        plot_viewpoints(xy[0], xy[1], yaw)
+        plot_target_and_path(target_xy=self.target_xy, path=planned_path)
+        plt.title(status_msg)
+        plt.savefig('./temp/global-map-label.png')
+        plt.figure("Global map (%d)" % self.step_i)
+
+        map_to_plot = global_map_pred[..., :1]
+        map_to_plot = np.pad(map_to_plot, [[0, 0], [0, 0], [0, 3-map_to_plot.shape[-1]]])
+        plt.imshow(map_to_plot)
+        plot_viewpoints(xy[0], xy[1], yaw)
+        plot_target_and_path(target_xy=self.target_xy, path=planned_path)
+        # plot_target_and_path(target_xy=self.target_xy_vel, path=np.array(self.hist2)[:, :2])
+        plt.title(status_msg)
+        plt.savefig('./temp/global-map-pred.png')
+
+        if global_map_pred.shape[-1] == 2:
+            map_to_plot = global_map_pred[..., 1:2]
+            map_to_plot = np.pad(map_to_plot, [[0, 0], [0, 0], [0, 3-map_to_plot.shape[-1]]])
+            plt.imshow(map_to_plot)
+            plot_viewpoints(xy[0], xy[1], yaw)
+            plot_target_and_path(target_xy=self.target_xy, path=planned_path)
+            # plot_target_and_path(target_xy=self.target_xy_vel, path=np.array(self.hist2)[:, :2])
+            plt.title(status_msg)
+            plt.savefig('./temp/global-obj-map-pred.png')
+
+        # plt.figure("Global map true (%d)" % self.step_i)
+        # map_to_plot = global_map_true_partial
+        # map_to_plot = np.pad(map_to_plot, [[0, 0], [0, 0], [0, 3-map_to_plot.shape[-1]]])
+        # plt.imshow(map_to_plot)
+        # plot_viewpoints(xy[0], xy[1], yaw)
+        # plot_target_and_path(target_xy=self.target_xy, path=planned_path)
+        # # plot_target_and_path(target_xy=self.target_xy, path=np.array(self.hist1)[:, :2])
+        # # plot_target_and_path(target_xy=self.target_xy_vel, path=np.array(self.hist2)[:, :2])
+        # plt.title(status_msg)
+        # plt.savefig('./temp/global-map-true.png')
+        # plt.figure("Global map plan (%d)" % self.step_i)
+
+        map_to_plot = global_map_for_planning
+        map_to_plot = np.pad(map_to_plot, [[0, 0], [0, 0], [0, 3-map_to_plot.shape[-1]]])
+        plt.imshow(map_to_plot)
+        plot_viewpoints(xy[0], xy[1], yaw)
+        plot_target_and_path(target_xy=self.target_xy, path=planned_path)
+        plt.title(status_msg)
+        plt.savefig('./temp/global-map-plan.png')
+
+        depth, rgb = mapping_visualizer.recover_depth_and_rgb(images)
+        if self.params.mode == 'depth' and sim_rgb is not None:
+            rgb = sim_rgb
+            rgb[:5, :5, :] = 0  # indicate this is not observed
+
+        images_fig, images_axarr = plt.subplots(2, 2, squeeze=True)
+        plt.title(status_msg)
+        plt.axes(images_axarr[0, 0])
+        plt.imshow(depth)
+        plt.axes(images_axarr[0, 1])
+        plt.imshow(rgb)
+        plt.axes(images_axarr[1, 0])
+        plt.imshow(local_map_pred * visibility_mask + (1 - visibility_mask) * 0.5)
+        plt.axes(images_axarr[1, 1])
+        if local_obj_map_pred is not None:
+            plt.imshow(local_obj_map_pred * visibility_mask + (1 - visibility_mask) * 0.5)
+        else:
+            plt.imshow(local_map_label * visibility_mask + (1 - visibility_mask) * 0.5)
+        plt.savefig('./temp/inputs.png')
+        # pdb.set_trace()
+        plt.close('all')
+
+    def run_inference(self, feed_dict):
+        outputs = self.sess.run(self.inference_outputs, feed_dict=feed_dict)
+        return outputs
 
     def inverse_rotate(self, vect, r, p, y):
         vect = rotate_vector_3d(vect, 0., 0., -y)
@@ -374,8 +500,8 @@ class MappingAgent(RandomAgent):
         target_r, target_fi, lin_vel, ang_vel = observations['sensor']
         target_r = target_r / map_resolution  # convert to map scale
         target_fi = -target_fi
-        lin_vel = lin_vel / map_resolution * sim_timestep
-        ang_vel = ang_vel * sim_timestep
+        lin_vel = sim2mapping(lin_vel=lin_vel)
+        ang_vel = sim2mapping(ang_vel=ang_vel)
 
         true_xy = np.copy(observations["pose"][:2])
         true_xy = sim2mapping(xy=true_xy)

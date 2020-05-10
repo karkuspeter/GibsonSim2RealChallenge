@@ -1,11 +1,15 @@
 gibson-challenge-data
+gibson-challenge-data*
 *.pyc
 .gitignore
 .git
 data/*tfrecords*
 data/eval*
 data/scen*
+data/map*
 GibsonEnvV2
 results
 submission
 x11docker
+temp
+src
