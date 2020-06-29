@@ -11,6 +11,7 @@ if [ $# -lt 2 ]; then
 	fi
 	rsync -avz --no-links --exclude-from rsync_exclude.txt ./ $server:~/code/GibsonSim2RealChallenge/
 	rsync -avz --no-links --exclude-from rsync_exclude.txt ../GibsonEnvV2/ $server:~/code/GibsonSim2RealChallenge/GibsonEnvV2/
+    rsync -avz --no-links --exclude-from ../mclnet/rsync_exclude.txt ../mclnet/ $server:~/mclnet/
     eval $extracmd
 else
     echo "Not supported"

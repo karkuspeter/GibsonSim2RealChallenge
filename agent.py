@@ -9,28 +9,30 @@ except:
 import matplotlib.pyplot as plt
 plt.ion()
 import time
-import os
+import os, sys
 
 from agents.myagents import ExpertAgent, MappingAgent
 import gibson2
 import numpy as np
 import json
+from utils import logger
 
 from arguments import parse_args
 
 from multiprocessing import Process, Pool, Lock, Manager
 
 
-SINGLE_PROCESS = False
+SINGLE_PROCESS = True
 
 
-def eval_helper(params, model_name, output_filename, write_lock=None, num_episodes_per_floor=4):
+def eval_helper(params, model_name, output_filename, logdir, write_lock=None, num_episodes_per_floor=4):
     from gibson2.envs.challenge import Challenge
 
-    agent = MappingAgent(params)
+    agent = MappingAgent(params, logdir=logdir, scene_name=str(model_name))
     challenge = Challenge()
     episode_infos = challenge.save_episodes(agent, output_filename=output_filename, models=[model_name],
-                                            write_lock=write_lock, num_episodes_per_floor=num_episodes_per_floor)
+                                            write_lock=write_lock, num_episodes_per_floor=num_episodes_per_floor,
+                                            display_mode=params.gibson_display_mode)
 
     return episode_infos
 
@@ -79,7 +81,7 @@ def run_in_separate_process(func, *args, **kwargs):
         try:
             return list(return_dict.values())[0]
         except IndexError:
-            import ipdb; ipdb.set_trace()
+            # import ipdb; ipdb.set_trace()
             return None
 
 
@@ -127,8 +129,13 @@ def main():
         # models = models[-3:]
     elif params.gibson_split == "evaltest":
         models = models[-10:]
+        num_episodes_per_floor = 10
+        num_repeats = 1
+        # models = models[-3:]
+    elif params.gibson_split == "minitest":
+        models = models[-10:]
         num_episodes_per_floor = 5
-        num_repeats = 2
+        num_repeats = 1
         # models = models[-3:]
     else:
         raise ValueError("Unknown split %s"%params.gibson_split)
@@ -189,12 +196,18 @@ def main():
 def evaluate_episodes(params, models, num_episodes_per_floor):
     track = os.environ['SIM2REAL_TRACK']
     timestamp_str = time.strftime('%m-%d-%H-%M-%S', time.localtime())
-    output_filename = './data/eval_{}_{}.tfrecords'.format(track, timestamp_str)
-    summary_filename = './temp/evals/eval_{}_{}'.format(track, timestamp_str)
+    logdir = './temp/evals/{}_{}'.format(track, timestamp_str)
+    os.makedirs(logdir)
+
+    output_filename = os.path.join(logdir, 'data.tfrecords')
+    summary_filename = os.path.join(logdir, 'stat')
+
+    sys.stdout = logger.Logger(os.path.join(logdir, "out.log"))
 
     episode_infos = []
     for model_i, model_name in enumerate(models):
         ep_info = run_in_separate_process(eval_helper, params, model_name, output_filename + '.{:03d}'.format(model_i),
+                                          logdir=logdir,
                                           num_episodes_per_floor=num_episodes_per_floor)
         if ep_info is None:
             print ("There was an error in evaluation for model %s. Skipping."%model_name)
@@ -215,6 +228,10 @@ def evaluate_episodes(params, models, num_episodes_per_floor):
                 episode_infos_dict[key].append(val)
 
         episode_infos_dict['has_collided'] = [(1. if val > 0 else 0.) for val in episode_infos_dict['collision_step']]
+        # collision before moving less then 10 cm (2x5cm) from initial pose
+        episode_infos_dict['has_collided_but_not_moved'] = [
+            (1. if episode_infos_dict['collision_step'][i] > 0 and episode_infos_dict['distance_from_start'][i] <= 2. else 0.)
+            for i in range(len(episode_infos_dict['collision_step']))]
         episode_infos_dict['success_strict'] = [(1. if succ > 0 and col < 1. else 0.) for succ, col in
                                                 zip(episode_infos_dict['success'], episode_infos_dict['has_collided'])]
         summary_dict = {}
@@ -223,13 +240,15 @@ def evaluate_episodes(params, models, num_episodes_per_floor):
         summary_dict['num_models'] = len(set(episode_infos_dict['model_id']))
         summary_dict['track'] = track
 
-        keys_to_mean = ['success', 'success_strict', 'has_collided', 'episode_length', 'spl', 'is_colliding', 'is_colliding_but_trav_map_free', 'is_colliding_but_scan_map_free', 'cpu_time']
+        keys_to_mean = ['success', 'success_strict', 'has_collided', 'episode_length', 'spl', 'is_colliding', 'has_collided_but_not_moved', 'is_colliding_but_trav_map_free', 'is_colliding_but_scan_map_free', 'cpu_time', 'path_length', 'timeout', 'collisions_allowed']
         for key in keys_to_mean:
             summary_dict['mean_'+key] = np.mean(episode_infos_dict[key])
 
         summary_dict['max_cpu_time_overall'] = np.max(episode_infos_dict['max_cpu_time'])
 
         episode_infos_dict.update(summary_dict)
+
+        episode_infos_dict['params'] = str(params)
 
         print ("%d/%d: Success %f; Stict: %f; Col %f; EpisodeLen: %f; SPL %f" % (
             episode_infos_dict['num_models'], len(models),
@@ -244,7 +263,13 @@ def evaluate_episodes(params, models, num_episodes_per_floor):
         with open(filename, 'w') as file:
             json.dump(summary_dict, file, indent=4)
         print (filename)
+        print (summary_dict)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        if isinstance(sys.stdout, logger.Logger):
+            sys.stdout.closefile()
+            sys.stdout = sys.stdout.terminal

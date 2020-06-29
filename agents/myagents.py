@@ -6,6 +6,9 @@ from agents.simple_agent import RandomAgent, ForwardOnlyAgent
 from agents.rl_agent import SACAgent
 
 import matplotlib.pyplot as plt
+import matplotlib.lines as mlines
+import matplotlib.markers
+import matplotlib.animation as animation
 import os
 import time
 
@@ -13,12 +16,15 @@ from train import get_brain
 from common_net import load_from_file, count_number_trainable_params
 from preprocess import sim2mapping, mapping2sim, object_map_from_states
 from visualize_mapping import plot_viewpoints, plot_target_and_path, mapping_visualizer
+from multiprocessing import Process, Queue
+import queue
 
 import numpy as np
 import tensorflow as tf
 
 from gibsonagents.expert import Expert
-from gibsonagents.classic_mapping import ClassicMapping
+from gibsonagents.classic_mapping import ClassicMapping, rotate_2d
+from gibsonagents.pathplanners import Dstar_planner
 
 # from gibson2.core.physics.scene import BuildingScene
 from gibson2.envs.locomotor_env import NavigateEnv
@@ -31,13 +37,44 @@ except Exception:
     import pdb
 
 
-POSE_ESTIMATION_SOURCE = 'velocity'  #''true' # 'velocity'
-MAP_SOURCE = 'pred'   # 'label'  # 'pred'
-USE_OBJECT_MAP_FOR_TRACK = [False, True, False]
-IGNORE_OBJECT_MAP = True
-PLOT_EVERY_N_STEP = -1  # 10
-START_WITH_SPIN = True
+MAP_SOURCE = 'pred'  # 'pred'   # 'label'  # 'pred'
+USE_OBJECT_MAP_FOR_TRACK = [False, True, True]
+IGNORE_OBJECT_MAP_FOR_COST = True
+USE_DYNAMIC_MAP = False
+CLEAR_DYNAMIC_MAP_EACH_STEP = False
+# DYNAMIC_MAP_CLEAR_DISTANCE = 10  # clear top n rows of dynamic map - need to implement within mapper brain
+DYNAMIC_MAP_RESCALE = 1.  # the smaller the more confident the prediction 0.5-->0.05
+LINVEL_DIRECTIONAL = True
+USE_GPU = True
 
+SAVE_VIDEO = 10
+PLOT_EVERY_N_STEP = -1  # 10
+
+# sim eval
+POSE_ESTIMATION_SOURCE = 'true'  # 'velocity'  #''true' # 'velocity'
+ARTIFICIAL_DELAY_STEPS = 0  #3  # 3
+MOTION_PARAMS = 'sim'  # 'sim'  #'real'  #'real'
+MAX_PLAN_SECONDS = 0.15  # 0.15  # 0.065  # 0.075  # 0.075
+PLANNER_KEEP_ALIVE = 50   # DISABLE THIS FOR REAL TRACK
+
+# # real track submission
+# POSE_ESTIMATION_SOURCE = 'velocity'  #''true' # 'velocity'
+# ARTIFICIAL_DELAY_STEPS = 0  #3  # 3
+# MOTION_PARAMS = 'real'  # 'sim'  #'real'  #'real'
+# MAX_PLAN_SECONDS = 0.065  # 0.15  # 0.065  # 0.075  # 0.075
+# PLANNER_KEEP_ALIVE = -1  # 50   # DISABLE THIS FOR REAL TRACK
+
+TRAVERSABLE_THRESHOLD = [0.38, 0.38, 0.499]  # 0.499  moved to params
+OBSTACLE_DOWNWEIGHT = [False, True, True]
+OBSTACLE_DOWNWEIGHT_DISTANCE = 20  # from top, smaller the further
+OBSTACLE_DOWNWEIGHT_SCALARS = (0.3, 0.8) # (0.3, 0.8)
+
+START_WITH_SPIN = True
+MAX_SPIN_STEPS = 40
+REDUCE_MAP_FOR_PLANNING = True
+SAFETY_REPLAN_IF_COST_INCREASE = 40
+
+# %run -p -s cumulative  -l 80 -T temp/prun4 agent.py  --gibson_mode evalsubmission --gibson_split evaltest
 
 
 class ExpertAgent(RandomAgent):
@@ -55,8 +92,28 @@ class ExpertAgent(RandomAgent):
         return observations["expert_action"]
 
 
+def planner_process_function(input_queue, output_queue):
+    while True:
+        if PLANNER_KEEP_ALIVE > 0:
+            try:
+                planid, offset, args, kwargs = input_queue.get(timeout=PLANNER_KEEP_ALIVE)
+            except queue.Empty:
+                print ("Exiting planner process.")
+                return
+        else:
+            planid, offset, args, kwargs = input_queue.get()
+        outputs = Expert.plan_policy(*args, **kwargs)
+
+        # Clear earlier results from queue
+        try:
+            output_queue.get(False)
+        except queue.Empty:
+            pass
+        output_queue.put((planid, offset, outputs))
+
+
 class MappingAgent(RandomAgent):
-    def __init__(self, params):
+    def __init__(self, params, logdir='./temp/', scene_name='scene'):
         super(MappingAgent, self).__init__()
 
         self.sim2real_track = str(os.environ["SIM2REAL_TRACK"])
@@ -80,31 +137,55 @@ class MappingAgent(RandomAgent):
             params.load = [load_for_track, ]
 
         params.object_map = (1 if USE_OBJECT_MAP_FOR_TRACK[track_i] else 0)
+        params.traversable_threshold = TRAVERSABLE_THRESHOLD[track_i]
 
         print (params)
 
-        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        assert params.sim == 'gibson'
+
+        self.planner_input_queue = None
+        self.planenr_output_queue = None
+        self.last_planner_output = None
+        self.last_path_cost = 0.
+        self.planner_process = None
+        self.plan_id = -1
+        self.plan_offset = np.array((0, 0), np.int32)
+
+        self.summary_str = ""
+        self.filename_addition = ""
+        self.logdir = logdir
+        self.scene_name = scene_name
+        self.num_videos_saved = 0
+
+        # self.pathplanner = Dstar_planner(single_thread=False)
+
+        if not USE_GPU:
+            os.environ["CUDA_VISIBLE_DEVICES"] = ""
         self.params = params
         self.pose_estimation_source = POSE_ESTIMATION_SOURCE
         self.map_source = MAP_SOURCE
         self.start_with_spin = START_WITH_SPIN
         self.max_confidence = 0.96   # 0.98
         self.confidence_threshold = None  # (0.2, 0.01)  # (0.35, 0.05)
-        self.use_custom_visibility = (self.params.visibility_mask == 2)
+        self.use_custom_visibility = (self.params.visibility_mask in [2, 20, 21])
         self.use_object_map = (self.params.object_map > 0)  # if want to change also need to overwrite params.object_map
 
         self.map_ch = (3 if self.use_object_map else 2)
         self.accumulated_spin = 0.
         self.spin_direction = None
 
+        self.delay_buffer = []
+        self.last_expert_state = None
+
         params.batchdata = 1
         params.trajlen = 1
         sensor_ch = (1 if params.mode == 'depth' else (3 if params.mode == 'rgb' else 4))
-        self.max_map_size = (800, 800)
+        self.max_map_size = (1200, 1200)
+        self.plan_map_size = (360, 360) if REDUCE_MAP_FOR_PLANNING else self.max_map_size
 
         # Build brain
         with tf.Graph().as_default():
-            with tf.device("/device:CPU:0"), tf.variable_scope(tf.get_variable_scope(), reuse=False):
+            with tf.variable_scope(tf.get_variable_scope(), reuse=False):
                 # dataflow input
                 train_brain = get_brain(params.brain, params)
                 req = train_brain.requirements()
@@ -122,6 +203,11 @@ class MappingAgent(RandomAgent):
                 self.visibility_input = tf.placeholder(shape=self.local_map_shape + (1, ), dtype=tf.uint8) if self.use_custom_visibility else None
                 local_obj_map_labels = tf.zeros((1, 1, ) + self.local_map_shape + (1, ), dtype=np.uint8)
 
+                if OBSTACLE_DOWNWEIGHT[track_i]:
+                    custom_obstacle_prediction_weight = Expert.get_obstacle_prediction_weight(OBSTACLE_DOWNWEIGHT_DISTANCE, OBSTACLE_DOWNWEIGHT_SCALARS, self.local_map_shape)
+                else:
+                    custom_obstacle_prediction_weight = None
+
                 self.inference_outputs = train_brain.sequential_inference(
                     self.true_map_input[None], self.images_input[None, None], self.xy_input[None, None], self.yaw_input[None, None],
                     actions, prev_global_map_logodds=self.global_map_input[None],
@@ -130,6 +216,7 @@ class MappingAgent(RandomAgent):
                     max_confidence=self.max_confidence,
                     max_obj_confidence=0.8,
                     custom_visibility_maps=None if self.visibility_input is None else self.visibility_input[None, None],
+                    custom_obstacle_prediction_weight=custom_obstacle_prediction_weight,
                     is_training=True)
 
                 # Add the variable initializer Op.
@@ -155,8 +242,10 @@ class MappingAgent(RandomAgent):
 
         self.target_xy_vel = np.zeros((2,))  # TODO remove
 
-        self.reset()
+        self.frame_traj_data = []
+        self.episode_i = -1
 
+        self.reset()
 
     def __del__(self):
         try:
@@ -173,38 +262,158 @@ class MappingAgent(RandomAgent):
         self.target_xy = np.zeros((2, ), np.float32)
         self.accumulated_spin = 0.
         self.spin_direction = None
+        self.last_expert_state = None
 
         self.hist1 = np.zeros((0, 3))
         self.hist2 = np.zeros((0, 3))
 
+        self.delay_buffer = [np.zeros((2,), np.float32)] * ARTIFICIAL_DELAY_STEPS
+        self.past_actions = [np.zeros((2,), np.float32)] * self.params.motion_delay_steps
+        self.traj_xy = []
+        self.traj_yaw = []
+        self.pred_traj_n_xy = []
+        self.pred_traj_n_yaw = []
+        self.pred_errors = []
+
+        self.plan_id += 1
+        self.plan_offset = np.array((0, 0), np.int32)
+
+        # Launch new planner process
+        self.start_planner_process_if_needed()
+
+        try:
+            while True:
+                self.planner_input_queue.get(False)
+        except queue.Empty:
+            pass
+        try:
+            while True:
+                self.planner_output_queue.get(False)
+        except queue.Empty:
+            pass
+        # while not self.planner_input_queue.empty():
+        #     self.planner_input_queue.get()
+        # while not self.planner_output_queue.empty():
+        #     self.planner_output_queue.get()
+
+        # # Launch new planner process
+        # if self.planner_process is not None:
+        #     self.planner_process.terminate()
+        # self.planner_input_queue = Queue()
+        # self.planner_output_queue = Queue()
+
+        # self.pathplanner.reset()
+
+        self.last_planner_output = None
+        self.last_path_cost = 0.
+        self.last_plan_update_step = -1
+
+        self.episode_i += 1
+
+        self.reset_video_writer()
+
         print ("Resetting agent.")
+
+    def start_planner_process_if_needed(self):
+        if (self.planner_process is None) or (not self.planner_process.is_alive()):
+            self.planner_input_queue = Queue()
+            self.planner_output_queue = Queue()
+            self.planner_process = Process(target=planner_process_function,
+                                           args=(self.planner_input_queue, self.planner_output_queue))
+            self.planner_process.start()
 
     @staticmethod
     def inverse_logodds(x):
         return 1. - 1. / (1 + np.exp(x))
 
-    def plan_and_control(self, xy_mapping, yaw_mapping, lin_vel_sim, ang_vel_sim, target_r_sim, target_fi_sim, global_map_pred, target_xy):
+    def motion_prediction(self, xy, yaw, past_xy, past_yaw, num_steps, model='lin2'):
 
+        assert len(self.past_actions) >= num_steps
+        xy_traj = [xy]
+        yaw_traj = [yaw]
+
+        if num_steps > 0:
+            past_n_actions = np.stack(self.past_actions[-num_steps:], axis=0)
+            if len(past_xy) < 1:
+                lin_vel = 0.
+                ang_vel = 0.
+            else:
+                motion_vect = xy - past_xy[-1]
+                if LINVEL_DIRECTIONAL:
+                    motion_vect = np.array((-np.cos(yaw - np.pi / 2), -np.sin(yaw - np.pi / 2))) * motion_vect
+                    # print(motion_vect, past_xy[-1], xy, yaw)
+                    lin_vel = np.linalg.norm(motion_vect, axis=0) * np.sign(motion_vect[1])
+                else:
+                    lin_vel = np.linalg.norm(motion_vect, axis=0)
+                ang_vel = yaw - past_yaw[-1]
+                ang_vel = (ang_vel + np.pi) % (2*np.pi) - np.pi
+
+            # Unroll motion model with past n actions
+            for act_fwd, act_rot in past_n_actions:
+                # predict lin and rot velocities
+                if model == 'lin1':
+                    # From real log (static)
+                    # lin_scaler = 0.6540917264778654
+                    # ang_scaler = 0.07866921965909571
+                    # # Sym v2
+                    # lin_scaler = 1.3600789433885767
+                    # ang_scaler = 0.1287800474224603
+
+                    if MOTION_PARAMS == 'sim':
+                        # ./temp/evals/eval_static_06-04-15-34-17_out.log
+                        lin_scaler, ang_scaler = 0.7093248690037459, 0.1224500742553487
+                    elif MOTION_PARAMS == 'inflated':
+                        # ./temp/evals/eval_static_06-04-15-34-17_out.log
+                        lin_scaler, ang_scaler = 0.7093248690037459 * 1.2, 0.1224500742553487 * 1.2
+                    else:
+                        lin_scaler, ang_scaler = 0.6395001626915873, 0.08237032666912558
+
+                    pred_lin_vel = act_fwd * lin_scaler
+                    pred_rot_vel = act_rot * ang_scaler
+                elif model == 'lin2':
+                    # ./temp/evals/eval_static_06-04-15-34-17_out.log
+                    param_vect = np.array((0.5474649003027493, 0.39226761787103714, 0.5027164023455273, 0.07327970777300274))
+
+                    pred_lin_vel = param_vect[0] * lin_vel + param_vect[1] * act_fwd
+                    pred_rot_vel = param_vect[2] * ang_vel + param_vect[3] * act_rot
+                else:
+                    raise ValueError(model)
+
+                # use predicted velocity to update pose
+                xy, yaw = self.velocity_update(xy, yaw, pred_lin_vel, pred_rot_vel)
+                xy_traj.append(xy)
+                yaw_traj.append(yaw)
+
+        return xy_traj, yaw_traj
+
+    @staticmethod
+    def update_planned_path_with_offset_change(path_map, offset, current_offset):
+        return path_map + (current_offset - offset)[None]
+
+    def plan_and_control(self, xy_mapping, yaw_mapping, prev_yaw_mapping, target_fi_sim, # lin_vel_sim, ang_vel_sim, target_r_sim, target_fi_sim,
+                         global_map_pred, target_xy):
         # Convert to sim representation for expert planning and control
         xy = mapping2sim(xy=xy_mapping)
         yaw = mapping2sim(yaw=yaw_mapping)
+        prev_yaw = mapping2sim(yaw=prev_yaw_mapping)
         global_map_pred = mapping2sim(global_map_pred=global_map_pred)
         target_xy = mapping2sim(xy=target_xy)
-        lin_vel = sim2mapping(lin_vel=lin_vel_sim)
-        ang_vel = sim2mapping(ang_vel=ang_vel_sim)
-
-        if self.start_with_spin and np.abs(self.accumulated_spin) < np.deg2rad(360 - 70) and self.step_i < 40:
-            if self.spin_direction is None:
-                self.spin_direction = -np.sign(target_fi_sim)  # spin opposite direction to the goal
-            self.accumulated_spin += ang_vel
-            # spin
-
-            print ("%d: spin %f: %f"%(self.step_i, self.spin_direction, self.accumulated_spin))
-
-            action = np.array((0., self.spin_direction * 1.))
-            planned_path = np.zeros((0, 2))
-            return action, planned_path
-
+        current_plan_offset = mapping2sim(xy=self.plan_offset)
+        # lin_vel = sim2mapping(lin_vel=lin_vel_sim)
+        # ang_vel = sim2mapping(ang_vel=ang_vel_sim)
+        #
+        # if self.start_with_spin and np.abs(self.accumulated_spin) < np.deg2rad(360 - 70) and self.step_i < MAX_SPIN_STEPS:
+        #     if self.spin_direction is None:
+        #         self.spin_direction = np.sign(target_fi_sim)  # spin opposite direction to the goal   # was negative when using ang_vel
+        #     self.accumulated_spin += yaw-prev_yaw
+        #     # spin
+        #
+        #     status_message = ("spin %f: %f"%(self.spin_direction, self.accumulated_spin))
+        #
+        #     action = np.array((0., self.spin_direction * 1.))
+        #     planned_path = np.zeros((0, 2))
+        #     return action, planned_path, sim2mapping(xy=xy.copy()), status_message
+        #
 
         # TODO need to treat case where map needs to be extended !!!!!
         #  Move this logic to map update instead
@@ -221,7 +430,7 @@ class MappingAgent(RandomAgent):
 
         if self.use_object_map:
             assert global_map_pred.shape[-1] == 2
-            if IGNORE_OBJECT_MAP:
+            if IGNORE_OBJECT_MAP_FOR_COST:
                 global_map_pred = global_map_pred[..., :1]
         else:
             assert global_map_pred.shape[-1] == 1
@@ -234,22 +443,112 @@ class MappingAgent(RandomAgent):
             rescale_scan_map=1.,
             erosion=self.scan_map_erosion,
             build_graph=False,
-            interactive_channel=self.use_object_map and not IGNORE_OBJECT_MAP,
+            interactive_channel=self.use_object_map and not IGNORE_OBJECT_MAP_FOR_COST,
         )
 
-        # TODO split plan and control.
-        #  Move it into third file, expert.py, as staticmethods and import that everywhere
-        #  Add PID control based on observed lin and ang velocity
-        action, obstacle_distance, planned_path, status_message = Expert.policy(
-            scan_map=scan_map, scan_graph=scan_graph, pos_map_float=xy, yaw=yaw, target_map_float=target_xy,
-            cost_map=cost_map)
+        # # Policy in one step
+        # action, obstacle_distance, planned_path, status_message, self.last_expert_state = Expert.policy(
+        #     scan_map=scan_map, scan_graph=scan_graph, pos_map_float=xy, yaw=yaw, target_map_float=target_xy,
+        #     cost_map=cost_map, prev_state=self.last_expert_state)
 
-        print ("%d: %f %s"%(self.step_i, time.time()-self.t, status_message))
-        self.t = time.time()
+        # # planner
+        # path_map, path_len_map = Expert.plan_policy(
+        #     scan_graph=scan_graph, pos_map_float=xy, yaw=yaw, target_map_float=target_xy,
+        #     cost_map=cost_map)
 
-        planned_path = sim2mapping(xy=planned_path)
+        # planner in separate process
+        args = ()
+        kwargs = dict(scan_graph=scan_graph, pos_map_float=xy, yaw=yaw, target_map_float=target_xy, cost_map=cost_map,
+                      max_map_size=self.plan_map_size)
 
-        return action, planned_path
+        self.start_planner_process_if_needed()
+
+        # clear queue in case last input was not even taken
+        try:
+            while True:
+                self.planner_input_queue.get(False)
+        except queue.Empty:
+            pass
+        try:
+            # Also clear output
+            while True:
+                plan_id, plan_offset, (path_map, path_len_map) = self.planner_output_queue.get(False)
+                # update plan if one already existed
+                if self.last_planner_output is not None and plan_id == self.plan_id:
+                    path_map = self.update_planned_path_with_offset_change(path_map, plan_offset, current_plan_offset)
+                    self.last_planner_output = (np.array(path_map), path_len_map)
+        except queue.Empty:
+            pass
+        self.planner_input_queue.put((self.plan_id, current_plan_offset, args, kwargs))
+        try:
+            plan_id, plan_offset, (path_map, path_len_map) = self.planner_output_queue.get(timeout=MAX_PLAN_SECONDS)
+            if plan_id != self.plan_id:
+                raise queue.Empty()
+            self.last_plan_update_step = self.step_i
+            path_map = self.update_planned_path_with_offset_change(path_map, plan_offset, current_plan_offset)
+        except queue.Empty:
+            if self.last_planner_output is None:
+                print ("Plan is not ready, but we dont have any plan yet..")
+                while True:
+                    plan_id, plan_offset, (path_map, path_len_map) = self.planner_output_queue.get(timeout=30.)
+                    if plan_id == self.plan_id:
+                        break
+                    print ("Wrong plan from earlier episode")
+                path_map = self.update_planned_path_with_offset_change(path_map, plan_offset, current_plan_offset)
+                self.last_plan_update_step = self.step_i
+                path_cost = np.sum(cost_map[path_map[:, 0], path_map[:, 1]])
+                self.last_path_cost = path_cost
+            else:
+                # find the closest along the path and skip anything before that
+                path_map, path_len_map = self.last_planner_output
+                assert path_map.ndim == 2
+                path_cost = np.sum(cost_map[path_map[:, 0], path_map[:, 1]])
+                cost_increase = path_cost - self.last_path_cost
+
+                closest_i = np.argmin(np.linalg.norm(path_map - xy[None], axis=1))
+                closest_i = max(min(closest_i, len(path_map)-2), 0)  # do not cut shorter than the last 2 steps (or single step if only has one step)
+                path_map = path_map[closest_i:]
+
+                print ("Plan is not ready. Cost increase %.1f Using earlier from step %d %d | path %d / %d."%(
+                    cost_increase, self.step_i-self.last_plan_update_step, self.last_plan_update_step, closest_i, len(path_map)))
+
+                if cost_increase > SAFETY_REPLAN_IF_COST_INCREASE and self.step_i < 300:
+                    action = np.array((0., 0.), np.float32)
+                    status_message = "Waiting for updated plan, cost increase too large."
+                    return action, sim2mapping(xy=path_map), sim2mapping(xy=xy.copy()), status_message
+
+
+        # # DStar planner
+        # path_map, path_len_map = self.pathplanner.dstar_path(
+        #     cost_map, tuple(xy.astype(np.int32)), tuple(target_xy.astype(np.int32)), timeout=MAX_PLAN_SECONDS, strict_timeout=(self.last_planner_output is not None))
+        # if path_map is None:
+        #     # find the closest along the path and skip anything before that
+        #     path_map, path_len_map = self.last_planner_output
+        #     assert path_map.ndim == 2
+        #     closest_i = np.argmin(np.linalg.norm(path_map - xy[None], axis=1))
+        #     closest_i = max(min(closest_i, len(path_map)-2), 0)  # do not cut shorter than the last 2 steps (or single step if only has one step)
+        #     print ("Plan is not ready. Using earlier one, from step %d / %d."%(closest_i, len(path_map)))
+        #     path_map = path_map[closest_i:]
+
+        self.last_planner_output = (np.array(path_map), path_len_map)
+
+        # controller
+        #  TODO Add PID control based on observed lin and ang velocity
+        action, obstacle_distance, planned_path, subgoal, status_message, self.last_expert_state =  Expert.control_policy(
+            path_map, path_len_map, scan_map=scan_map, pos_map_float=xy, yaw=yaw, target_map_float=target_xy,
+            cost_map=cost_map, prev_state=self.last_expert_state, control_params=self.params.pid_params)
+
+        # FOR VIDEO ONLY OVERWRITE HERE
+        if self.start_with_spin and np.abs(self.accumulated_spin) < np.deg2rad(360 - 70) and self.step_i < MAX_SPIN_STEPS:
+            if self.spin_direction is None:
+                self.spin_direction = np.sign(target_fi_sim)  # spin opposite direction to the goal   # was negative when using ang_vel
+            self.accumulated_spin += yaw-prev_yaw
+            # spin
+
+            status_message = ("spin %f: %f"%(self.spin_direction, self.accumulated_spin))
+            action = np.array((0., self.spin_direction * 1.))
+
+        return action, sim2mapping(xy=planned_path), sim2mapping(xy=subgoal), status_message
 
     def act(self, observations):
         # print (observations.keys())
@@ -272,35 +571,55 @@ class MappingAgent(RandomAgent):
             observations["lin_vel_3d"] = np.zeros((3,))
             observations["ang_vel_3d"] = np.zeros((3,))
             observations["quat"] = np.zeros((4,))
+            observations["object_states"] = np.zeros((0, 4))
             observations["expert_action"] = np.zeros((2,))
 
 
         # Target from extra state obs.
+        prev_yaw = self.yaw
         self.update_pose_from_observation(observations)
         # Updates xy, yaw, target_xy all represented in mapping format  (transposed map used in neural net)
 
         target_r, target_fi, lin_vel, ang_vel = observations['sensor']
 
+        # # Motion prediction
+        pred_xy_traj, pred_yaw_traj = self.motion_prediction(
+            self.xy, self.yaw, self.traj_xy, self.traj_yaw, num_steps=self.params.motion_delay_steps,
+            model=self.params.motion_model)
+        xy_for_planning = pred_xy_traj[-1]
+        yaw_for_planning = pred_yaw_traj[-1]
+        if len(pred_yaw_traj) >= 2:
+            prev_yaw_for_planning = pred_yaw_traj[-2]
+        else:
+            prev_yaw_for_planning = prev_yaw if self.step_i > 0 else self.yaw
+
         # Expand map and offset pose if needed, such that target and the surrounding of current pose are all in the map.
         map_shape = self.global_map_logodds.shape
         local_map_max_extent = 110  # TODO need to adjust to local map size and scaler
         target_margin = 8
-        min_x = int(min(self.target_xy[0] - target_margin, self.xy[0] - local_map_max_extent) - 1)
-        min_y = int(min(self.target_xy[1] - target_margin, self.xy[1] - local_map_max_extent) - 1)
-        max_x = int(max(self.target_xy[0] + target_margin, self.xy[0] + local_map_max_extent) + 1)
-        max_y = int(max(self.target_xy[1] + target_margin, self.xy[1] + local_map_max_extent) + 1)
-        offset_xy = np.array([max(0, -min_x), max(0, -min_y)])
-        expand_xy = np.array([max(0, max_x+1-map_shape[0]), max(0, max_y+1-map_shape[1])])
+        min_xy = np.stack([self.target_xy - target_margin, self.xy - local_map_max_extent, xy_for_planning - local_map_max_extent], axis=0)
+        min_xy = np.min(min_xy, axis=0).astype(np.int) - 1
+        max_xy = np.stack([self.target_xy + target_margin, self.xy + local_map_max_extent, xy_for_planning + local_map_max_extent], axis=0)
+        max_xy = np.max(max_xy, axis=0).astype(np.int) + 1
+        offset_xy = np.array([max(0, -min_xy[0]), max(0, -min_xy[1])])
+        expand_xy = np.array([max(0, max_xy[0]+1-map_shape[0]), max(0, max_xy[1]+1-map_shape[1])])
         # print ("Offset", offset_xy, expand_xy)
 
         self.global_map_logodds = np.pad(
             self.global_map_logodds, [[offset_xy[0], expand_xy[0]], [offset_xy[1], expand_xy[1]], [0, 0]],
             mode='constant', constant_values=0.)
-        self.xy += offset_xy
-        self.target_xy += offset_xy
-        self.true_map_offset_xy += offset_xy
-        self.hist1[:, :2] += offset_xy
-        self.hist2[:, :2] += offset_xy
+        if np.any(offset_xy > 0):
+            self.xy += offset_xy
+            xy_for_planning += offset_xy
+            self.traj_xy = [val + offset_xy for val in self.traj_xy]
+            self.pred_traj_n_xy = [val + offset_xy[None] for val in self.pred_traj_n_xy]
+            self.target_xy += offset_xy
+            self.true_map_offset_xy += offset_xy
+            self.hist1[:, :2] += offset_xy
+            self.hist2[:, :2] += offset_xy
+            self.plan_offset += offset_xy
+            if self.last_planner_output is not None:
+                self.last_planner_output = (self.last_planner_output[0] + offset_xy[None], self.last_planner_output[1])
         map_shape = self.global_map_logodds.shape
 
         if map_shape[0] > self.max_map_size[0] or map_shape[1] > self.max_map_size[1]:
@@ -320,7 +639,7 @@ class MappingAgent(RandomAgent):
         images = images * (2. / 255.) - 1.  # to network input -1..1 format
 
         # TODO mapping label comes from floor_scan_0.png, this might have extra dispersion.
-        #  This input is useless since coordinate frames do not match.
+        #  This input is useless since coordinate frames do not match.  !!!
         global_map_label = observations["trav_map"]
         global_map_label = global_map_label[:, :, :1]  # input it as uint8
         assert global_map_label.dtype == np.uint8
@@ -346,7 +665,7 @@ class MappingAgent(RandomAgent):
             self.true_map_input: true_map_input,
         }
         if self.visibility_input is not None:
-            visibility_map = ClassicMapping.is_visible_from_depth(depth, self.local_map_shape, zoom_factor=self.brain_requirements.transform_window_scaler)
+            visibility_map = ClassicMapping.is_visible_from_depth(depth, self.local_map_shape, sim=self.params.sim, zoom_factor=self.brain_requirements.transform_window_scaler)
             feed_dict[self.visibility_input] = visibility_map[:, :, None].astype(np.uint8)
 
         outputs = self.run_inference(feed_dict)
@@ -360,7 +679,23 @@ class MappingAgent(RandomAgent):
 
         # global_map_true = self.inverse_logodds(self.global_map_logodds[:, :, 0])
         global_map_true_partial = self.inverse_logodds(self.global_map_logodds[:, :, 0:1])
-        if self.use_object_map:
+        if self.use_object_map and USE_DYNAMIC_MAP and self.sim2real_track == 'dynamic':
+            # Special treatment of temporary dynamic map.
+            global_map_pred = self.inverse_logodds(self.global_map_logodds[:, :, 1:2])
+            dynamic_map_pred = self.inverse_logodds(self.global_map_logodds[:, :, 2:3])
+
+            # Merge dynamic map into standard map
+            dynamic_object_filter = (dynamic_map_pred <= 0.499)  # predict presence of dynamic object
+            # Replace global map prediction where dynamic map prediction is more pessimistic
+            global_map_pred[dynamic_object_filter] = np.minimum(global_map_pred[dynamic_object_filter], dynamic_map_pred[dynamic_object_filter] * DYNAMIC_MAP_RESCALE)
+            print ("dynamic map %d"%np.count_nonzero(dynamic_object_filter))
+
+            # Clear dynamic map for next step
+            if CLEAR_DYNAMIC_MAP_EACH_STEP:
+                self.global_map_logodds[:, :, 2:3] = 0.
+
+            local_obj_map_pred = outputs.combined_local_map_pred[0, 0, :, :, 1]
+        elif self.use_object_map:
             global_map_pred = self.inverse_logodds(self.global_map_logodds[:, :, 1:3])
             local_obj_map_pred = outputs.combined_local_map_pred[0, 0, :, :, 1]
         else:
@@ -369,42 +704,267 @@ class MappingAgent(RandomAgent):
 
         # action = observations["expert_action"]
 
-        if self.map_source == 'true':
-            assert global_map_label.ndim == 3
-            global_map_for_planning = global_map_label.astype(np.float32) * (1./255.)  # Use full true map
-            if self.use_object_map:
-                object_map_label = object_map_from_states(observations['object_states'], global_map_label.shape, combine_maps=True)
-                assert object_map_label.dtype == np.uint8
-                object_map_label = object_map_label.astype(np.float32) * (1./255.)
-                global_map_for_planning = np.concatenate((global_map_for_planning, object_map_label), axis=-1)
+        true_global_map = global_map_label.astype(np.float32) * (1./255.)  # Use full true map
+        if self.use_object_map:
+            object_map_label = object_map_from_states(observations['object_states'], global_map_label.shape, combine_maps=True)
+            assert object_map_label.dtype == np.uint8
+            object_map_label = object_map_label.astype(np.float32) * (1./255.)
+            true_global_map = np.concatenate((true_global_map, object_map_label), axis=-1)
+        true_global_map = np.pad(
+            true_global_map, [[self.plan_offset[0], 0], [self.plan_offset[1], 0], [0, 0]],
+            mode='constant', constant_values=0.5)
 
-        # global_map_for_planning = global_map_true_partial
+        if self.map_source == 'true':
+            assert POSE_ESTIMATION_SOURCE == 'true'  # otherwise need to match coordinate frames
+            assert global_map_label.ndim == 3
+            global_map_for_planning = true_global_map
         else:
             global_map_for_planning = global_map_pred
 
         # threshold
-        traversable_threshold = 0.499  # higher than this is traversable
-        if IGNORE_OBJECT_MAP:
+        traversable_threshold = self.params.traversable_threshold
+        if IGNORE_OBJECT_MAP_FOR_COST:
             object_treshold = 0.  # treat everything as non-object
         else:
-            object_treshold = 0.499  # treat as non-object by default
+            object_treshold = traversable_threshold  # treat as non-object by default
         threshold_const = np.array((traversable_threshold, object_treshold))[None, None, :self.map_ch-1]
-        global_map_for_planning = np.array(global_map_for_planning >= threshold_const, np.float32)
+        binary_global_map_for_planning = np.array(global_map_for_planning >= threshold_const, np.float32)
 
         # plan
-        action, planned_path = self.plan_and_control(
-            self.xy, self.yaw, lin_vel, ang_vel, target_r, target_fi, global_map_pred=global_map_for_planning,
+        action, planned_path, planned_subgoal, status_message = self.plan_and_control(
+            xy_for_planning, yaw_for_planning, prev_yaw_for_planning, # lin_vel, ang_vel, target_r,
+            target_fi,
+            global_map_pred=binary_global_map_for_planning,
             target_xy=self.target_xy)
+
+
+        target_status = "%4d %2.1f"%(int(np.rad2deg(target_fi)),  target_r)
+        control_status = ("%d: %f %s"%(self.step_i, time.time()-self.t, status_message))
+        print (control_status + " | " + target_status)
+        self.t = time.time()
 
         # Visualize agent
         if self.step_i % PLOT_EVERY_N_STEP == 0 and PLOT_EVERY_N_STEP > 0:
-            self.visualize_agent(outputs, images, global_map_pred, global_map_for_planning, global_map_label,
+            self.visualize_agent(outputs, images, global_map_pred, binary_global_map_for_planning, global_map_label,
                                  global_map_true_partial, local_map_pred, local_map_label, planned_path,
                                  sim_rgb=observations['rgb'], local_obj_map_pred=local_obj_map_pred)
 
-        self.step_i += 1
+        self.past_actions.append(np.array(action))
+        self.traj_xy.append(self.xy.copy())
+        self.traj_yaw.append(self.yaw.copy())
+        self.pred_traj_n_xy.append(np.array(pred_xy_traj))
+        self.pred_traj_n_yaw.append(np.array(pred_yaw_traj))
 
+        pred_errors = []
+        for i in range(1, self.params.motion_delay_steps+1):
+            if len(self.pred_traj_n_xy) <= i:
+                error_xy = 0.
+                error_yaw = 0.
+            else:
+                error_xy = np.linalg.norm(self.pred_traj_n_xy[-i-1][i] - self.xy, axis=0)
+                error_yaw = np.abs(self.pred_traj_n_yaw[-i-1][i] - self.yaw)
+            pred_errors.append((error_xy, error_yaw))
+        self.pred_errors.append(pred_errors)
+        motion_pred_status = (" ".join(["p%d: %.1f,"%(i+1, pred_errors[i][0]) for i in range(self.params.motion_delay_steps)]) + " | " +
+               " ".join(["p%d: %.1f,"%(i+1, np.rad2deg(pred_errors[i][1])) for i in range(self.params.motion_delay_steps)]))
+        print (motion_pred_status)
+
+        # Add artificial delay
+        if ARTIFICIAL_DELAY_STEPS > 0:
+            assert len(self.delay_buffer) == ARTIFICIAL_DELAY_STEPS
+            self.delay_buffer.append(action)
+            action = self.delay_buffer[0]
+            self.delay_buffer = self.delay_buffer[1:]
+            intended_action = self.delay_buffer[-1]
+        else:
+            intended_action = action
+
+        act_status = ("%d: delay%d %.3f %.3f %.3f act %.2f %.2f --> %.3f %.3f %.3f act %f %f "%(
+            self.step_i, ARTIFICIAL_DELAY_STEPS, self.xy[0], self.xy[1], np.rad2deg(self.yaw),
+            intended_action[0], intended_action[1],
+            pred_xy_traj[-1][0], pred_xy_traj[-1][1], np.rad2deg(pred_yaw_traj[-1]), action[0], action[1]))
+        print (act_status)
+
+        if SAVE_VIDEO > self.num_videos_saved:
+            self.frame_traj_data.append(dict(
+                rgb=observations['rgb'], global_map=global_map_pred.copy(),
+                true_global_map=true_global_map.copy(), xy=self.xy.copy(), yaw=self.yaw.copy(),
+                target_xy=self.target_xy.copy(),
+                path=planned_path.copy(), subgoal=planned_subgoal.copy(),
+                target_status=target_status, control_status=control_status, act_status=act_status))
+
+        self.step_i += 1
         return action
+
+    def video_update(self, frame_i):
+        # frame skip of 3
+        if frame_i % 3 == 0:
+            ind = min(frame_i // 3, len(self.frame_traj_data)-1)
+            self.video_image_ax.set_data(self.frame_traj_data[ind]['rgb'])
+            self.video_text_ax1.set_text(self.frame_traj_data[ind]['target_status'])
+            split_str = self.frame_traj_data[ind]['control_status']
+            # Attempt to break lines
+            segs = split_str.split("[")
+            if len(segs) > 1:
+                split_str = segs[0] + "\n["+"[".join(segs[1:])
+            segs = split_str.split(" v=")
+            if len(segs) > 1:
+                split_str = segs[0] + "\nv=" + " v=".join(segs[1:])
+            self.video_text_ax2.set_text(split_str)
+
+            if self.video_global_map_ax is not None:
+                xy = self.frame_traj_data[ind]['xy']
+                target_xy = self.frame_traj_data[ind]['target_xy']
+                subgoal = self.frame_traj_data[ind]['subgoal']
+                path = self.frame_traj_data[ind]['path']
+                if len(path) == 0:
+                    path = xy[None]
+
+                global_map = np.atleast_3d(self.frame_traj_data[ind]['global_map'])
+                global_map = np.tile(global_map[:, :, :1], [1, 1, 3])
+                true_map = np.atleast_3d(self.frame_traj_data[ind]['true_global_map'])
+
+                # # Crop true map to meaningful area
+                # true_map = true_map[:np.max(np.nonzero(true_map)[0])+2, :np.max(np.nonzero(true_map)[1])+2, :1]
+                # true_map = np.tile(true_map, [1, 1, 3])
+                # true_map = np.pad(true_map, [[0, max(0, global_map.shape[0]-true_map.shape[0])], [0, max(0, global_map.shape[1]-true_map.shape[1])], [0, 0]])
+                # global_map = np.pad(global_map, [[0, max(0, true_map.shape[0]-global_map.shape[0])], [0, max(0, true_map.shape[1]-global_map.shape[1])], [0, 0]], constant_values=0.5)
+                # combined_map = 0.2 * true_map + 0.8 * global_map * np.array((1., 1., 0.))[None, None]  # yellow
+
+                map_size = 300
+                # Cut it to fixed size 300 x 300
+                center_xy = (xy + target_xy) * 0.5
+                desired_center_xy = np.array(map_size, np.float32) * 0.5
+                center_xy = center_xy.astype(np.int)
+                desired_center_xy = desired_center_xy.astype(np.int)
+
+                offset_xy = (desired_center_xy - center_xy).astype(np.int)
+
+                xy += offset_xy
+                target_xy += offset_xy
+                subgoal += offset_xy
+                path += offset_xy[None]
+
+                map_start_xy = np.maximum(center_xy - map_size//2, 0)
+                map_cutoff_xy = -np.minimum(center_xy - map_size//2, 0)
+                global_map = global_map[map_start_xy[0]:map_start_xy[0]+map_size-map_cutoff_xy[0], map_start_xy[1]:map_start_xy[1]+map_size-map_cutoff_xy[1]]
+
+                combined_map = np.ones((map_size, map_size, 3), np.float32) * 0.5
+                combined_map[map_cutoff_xy[0]:map_cutoff_xy[0] + global_map.shape[0], map_cutoff_xy[1]:global_map.shape[1]+map_cutoff_xy[1]] = global_map
+
+                # global_map = global_map[:map_size-map_offset_xy[0], :map_size-map_offset_xy[1]]
+                # combined_map[map_offset_xy[0]:map_offset_xy[0]+global_map.shape[0], map_offset_xy[1]:map_offset_xy[1]+global_map.shape[1]] = global_map
+
+                combined_map[int(xy[0])-1:int(xy[0])+2, int(xy[1])-1:int(xy[1]+2)] = (0., 1., 0.)
+
+                # print (self.video_ax.get_xlim())
+                self.video_ax.set_xlim(-0.5, combined_map.shape[1]-0.5)
+                self.video_ax.set_ylim(combined_map.shape[0]-0.5, -0.5)
+                self.video_global_map_ax.set_data(combined_map)
+                self.video_global_map_ax.set_extent([-0.5, combined_map.shape[1]-0.5, combined_map.shape[0]-0.5, -0.5])
+
+                # # View angle
+                # half_fov = 0.5 * np.deg2rad(70)
+                # for ang_i, angle in enumerate([half_fov, -half_fov]):
+                #     angle = angle - float(self.frame_traj_data[ind]['yaw'])
+                #     # angle = angle + yaw[batch_i, traj_i, 0]
+                #     v = np.array([np.cos(angle), np.sin(angle)]) * 10.
+                #     x1 = np.array([xy[1], xy[0]])  # need to be flipped for display
+                #     x2 = v + x1
+                #
+                #     self.video_view_angle_lines[ang_i].set_data([x1[0], x2[0]], [x1[1], x2[1]])
+                #
+                # # pdb.set_trace()
+                # # Path
+                # skip = 4
+                # # # print(self.frame_traj_data[ind]['xy'], path[0])
+                # # for i in range(len(self.video_path_circles)-2):
+                # #     path_i = min(i * 4, len(path)-1)
+                # #     xy = path[path_i]
+                # #     self.video_path_circles[i].center = ([xy[1], xy[0]])
+                # # # Sub-goal
+                # # xy = self.frame_traj_data[ind]['subgoal']
+                # # self.video_path_circles[-2].center = ([xy[1], xy[0]])
+                # # # Target
+                # # xy = path[-1]
+                # # self.video_path_circles[-1].center = ([xy[1], xy[0]])
+                # self.video_path_scatter.set_offsets(np.flip(path[::skip], axis=-1))
+                # self.video_subgoal_scatter.set_offsets([np.flip(subgoal, axis=-1)])
+                # self.video_target_scatter.set_offsets([np.flip(path[-1], axis=-1)])
+
+            # self.video_text_ax2.set_data(self.summary_str)
+        return self.video_image_ax
+
+    def reset_video_writer(self):
+        if len(self.frame_traj_data) > 0:
+            # Save video
+            if False:
+                fig = plt.figure()
+                ax = fig.add_subplot(111)
+                ax.set_aspect('equal')
+                ax.get_xaxis().set_visible(False)
+                ax.get_yaxis().set_visible(False)
+
+                self.video_image_ax = ax.imshow(np.zeros((90, 160, 3)))
+                self.video_global_map_ax = None
+                self.video_text_ax0 = fig.text(0.04, 0.9, self.summary_str, transform=fig.transFigure, fontsize=10, verticalalignment='top')  # bottom left
+
+                self.video_text_ax1 = fig.text(0.96, 0.9, "Target", transform=fig.transFigure, fontsize=10, verticalalignment='top', horizontalalignment='right')
+                self.video_text_ax2 = fig.text(0.04, 0.05, "Status2", transform=fig.transFigure, fontsize=10, verticalalignment='bottom', wrap=True)
+            else:
+                fig = plt.figure()
+                ax = fig.add_subplot(121)
+                ax.set_aspect('equal')
+                ax.get_xaxis().set_visible(False)
+                ax.get_yaxis().set_visible(False)
+                self.video_image_ax = ax.imshow(np.zeros((90, 160, 3)))
+
+                ax = fig.add_subplot(122)
+                ax.set_aspect('equal')
+                ax.get_xaxis().set_visible(False)
+                ax.get_yaxis().set_visible(False)
+                self.video_global_map_ax = ax.imshow(np.zeros((1200, 1200, 3)))
+                self.video_ax = ax
+
+                # self.video_view_angle_lines = [mlines.Line2D([0., 0.], [10., 10.,], color='green') for _ in range(2)]
+                # ax.add_line(self.video_view_angle_lines[0])
+                # ax.add_line(self.video_view_angle_lines[1])
+                # self.video_path_circles = []
+                # for i in range(20):
+                #     circle = plt.Circle((0., 0.), 2., color=('red' if i >= 18 else 'orange'), fill=False, transform='data')
+                #     ax.add_artist(circle)
+                #     self.video_path_circles.append(circle)
+                # self.video_view_angle_lines = []
+                # for _ in range(2):
+                #     self.video_view_angle_lines.extend(ax.plot([0., 1.], [0., 1.], '-', color='blue'))  # plot returns a list of lines
+                #
+                # self.video_path_scatter = ax.scatter([0.], [1.], s=2., c='green', marker='o')
+                # self.video_subgoal_scatter = ax.scatter([0.], [1.], s=2.5, c='green', marker=matplotlib.markers.MarkerStyle(marker='o', fillstyle='full'))
+                # self.video_target_scatter = ax.scatter([0.], [1.], s=2., c='red', marker='o')
+
+                self.video_text_ax0 = fig.text(0.04, 0.9, self.summary_str, transform=fig.transFigure, fontsize=10,
+                                               verticalalignment='top')  # bottom left
+
+                self.video_text_ax1 = fig.text(0.96, 0.9, "Target", transform=fig.transFigure, fontsize=10,
+                                               verticalalignment='top', horizontalalignment='right')
+                self.video_text_ax2 = fig.text(0.04, 0.05, "Status2", transform=fig.transFigure, fontsize=10,
+                                               verticalalignment='bottom', wrap=True)
+
+
+
+            # im.set_clim([0, 1])
+            fig.set_size_inches([5, 5])
+            plt.tight_layout()
+
+            ani = animation.FuncAnimation(fig, self.video_update, len(self.frame_traj_data) * 3 + 21, interval=100)  # time between frames in ms. overwritted by fps below
+            writer = animation.writers['ffmpeg'](fps=30)
+            video_filename = os.path.join(self.logdir, '%s_rgb_%s_%d%s.mp4'%(self.scene_name, self.sim2real_track, self.episode_i, self.filename_addition))
+            ani.save(video_filename, writer=writer, dpi=100)
+
+            print ("Video saved to "+video_filename)
+            self.num_videos_saved += 1
+
+        self.frame_traj_data = []
 
     def visualize_agent(self, outputs, images, global_map_pred, global_map_for_planning, global_map_label,
                         global_map_true_partial, local_map_pred, local_map_label, planned_path, sim_rgb=None, local_obj_map_pred=None):
@@ -473,12 +1033,12 @@ class MappingAgent(RandomAgent):
         plt.axes(images_axarr[0, 1])
         plt.imshow(rgb)
         plt.axes(images_axarr[1, 0])
-        plt.imshow(local_map_pred * visibility_mask + (1 - visibility_mask) * 0.5)
+        plt.imshow(local_map_pred * visibility_mask + (1 - visibility_mask) * 0.5, vmin=0., vmax=1.)
         plt.axes(images_axarr[1, 1])
         if local_obj_map_pred is not None:
-            plt.imshow(local_obj_map_pred * visibility_mask + (1 - visibility_mask) * 0.5)
+            plt.imshow(local_obj_map_pred * visibility_mask + (1 - visibility_mask) * 0.5, vmin=0., vmax=1.)
         else:
-            plt.imshow(local_map_label * visibility_mask + (1 - visibility_mask) * 0.5)
+            plt.imshow(local_map_label * visibility_mask + (1 - visibility_mask) * 0.5, vmin=0., vmax=1.)
         plt.savefig('./temp/inputs.png')
         # pdb.set_trace()
         plt.close('all')
@@ -533,7 +1093,7 @@ class MappingAgent(RandomAgent):
             # xy_vel, yaw_vel = self.velocity_update(prev_xy_vel, yaw, lin_vel, 0.)
 
             self.xy = xy
-            self.yaw = yaw
+            self.yaw = np.array(yaw)
 
             self.hist1 = np.append(self.hist1, [[self.xy[0], self.xy[1], self.yaw]], axis=0)
             self.hist2 = np.append(self.hist2, [[xy_vel[0], xy_vel[1], yaw_vel]], axis=0)
@@ -643,6 +1203,9 @@ class MappingAgent(RandomAgent):
 
     @staticmethod
     def velocity_update(xy, yaw, lin_vel, ang_vel):
+        xy = np.array(xy)
+        yaw = np.array(yaw)
+
         yaw += ang_vel
         vect = np.array((-np.cos(yaw - np.pi/2), -np.sin(yaw - np.pi/2))) * lin_vel
         xy += vect
